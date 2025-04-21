@@ -23,3 +23,4 @@ pub const WorkPool = server.WorkPool;
 // backends
 pub const basic = server.basic;
 pub const LinuxIoUring = server.LinuxIoUring;
+pub const connection = server.connection;

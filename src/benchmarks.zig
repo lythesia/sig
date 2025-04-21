@@ -34,6 +34,7 @@ const Benchmark = enum {
     accounts_db,
     accounts_db_readwrite,
     accounts_db_snapshot, // expensive
+    snapshot_download, // expensive
     bincode,
     geyser,
     gossip,
@@ -271,6 +272,17 @@ pub fn main() !void {
                 &maybe_metrics,
             );
         }
+    }
+
+    if ((filter == .snapshot_download or run_all_benchmarks)) {
+        try benchmark(
+            allocator,
+            logger,
+            @import("accountsdb/download.zig").BenchmarkDownload,
+            Duration.fromSecs(30),
+            .millis,
+            &maybe_metrics,
+        );
     }
 
     if (filter == .socket_utils or run_all_benchmarks) {

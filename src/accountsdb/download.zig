@@ -2,10 +2,12 @@
 
 const std = @import("std");
 const sig = @import("../sig.zig");
+const BenchTimeUnit = @import("../benchmarks.zig").BenchTimeUnit;
 
 const GossipService = sig.gossip.GossipService;
 const GossipTable = sig.gossip.GossipTable;
 const KeyPair = std.crypto.sign.Ed25519.KeyPair;
+const LinuxSplice = sig.net.linux_splice.LinuxSplice;
 const LegacyContactInfo = sig.gossip.data.LegacyContactInfo;
 const Logger = sig.trace.Logger;
 const Pubkey = sig.core.Pubkey;
@@ -253,9 +255,6 @@ pub fn downloadSnapshotsFromGossip(
         const FullSnapshotFileInfo = sig.accounts_db.snapshots.FullSnapshotFileInfo;
         const IncrementalSnapshotFileInfo = sig.accounts_db.snapshots.IncrementalSnapshotFileInfo;
 
-        const download_buffer = try allocator.alloc(u8, 1 * BYTE_PER_MIB);
-        defer allocator.free(download_buffer);
-
         for (available_snapshot_peers.items) |peer| {
             const rpc_socket = peer.contact_info.rpc_addr.?;
             const rpc_url = rpc_socket.toString();
@@ -286,7 +285,7 @@ pub fn downloadSnapshotsFromGossip(
                 output_dir,
                 snapshot_filename.constSlice(),
                 min_mb_per_sec,
-                download_buffer,
+                false,
             ) catch |err| {
                 switch (err) {
                     error.TooSlow => {
@@ -331,7 +330,7 @@ pub fn downloadSnapshotsFromGossip(
                     inc_snapshot_filename.constSlice(),
                     // NOTE: no min limit (we already downloaded the full snapshot at a good speed so this should be ok)
                     null,
-                    download_buffer,
+                    false,
                 ) catch |err| {
                     // failure here is ok (for now?)
                     logger.warn().logf("failed to download inc_snapshot: {s}", .{@errorName(err)});
@@ -357,7 +356,8 @@ fn downloadFile(
     maybe_min_mib_per_second: ?usize,
     /// Used as an intermediate buffer to read the response body before writing to disk.
     /// Recommended size is at least 1 MiB for payloads which are expected to occupy 1 GiB or more.
-    download_buffer: []u8,
+    // download_buffer: []u8,
+    force_basic: bool,
 ) !std.fs.File {
     var http_client: std.http.Client = .{ .allocator = allocator };
     defer http_client.deinit();
@@ -375,20 +375,22 @@ fn downloadFile(
     const download_size = request.response.content_length orelse
         return error.NoContentLength;
 
-    if (download_buffer.len < 1 * BYTE_PER_MIB and
-        download_size >= BYTE_PER_GIB)
-    {
-        logger.warn().logf("Downloading file of size {} using a buffer of size {};" ++
-            " recommended buffer size for such a payload is at least 1 MiB.", .{
-            std.fmt.fmtIntSizeBin(download_size),
-            std.fmt.fmtIntSizeBin(download_buffer.len),
-        });
-    }
-
     const output_file = try output_dir.createFile(filename, .{});
     errdefer output_file.close();
     try output_file.setEndPos(download_size);
-    var buffered_out = std.io.bufferedWriter(output_file.writer());
+
+    const can_splice = request.response.transfer_compression == .identity and LinuxSplice.can_use;
+    var downloader: Downloader = undefined;
+    if (force_basic or !can_splice) {
+        const download_buffer = try allocator.alloc(u8, 1 * BYTE_PER_MIB);
+        var buffered_out = std.io.bufferedWriter(output_file.writer());
+        downloader = Downloader{ .basic = .{ .request = &request, .download_buffer = download_buffer, .buf_writer = &buffered_out } };
+    } else {
+        const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
+        logger.info().log("using splice..");
+        downloader = Downloader{ .splice = .{ .request = &request, .pipe = pipe, .file = &output_file } };
+    }
+    defer downloader.deinit(allocator);
 
     var total_bytes_read: u64 = 0;
     var lap_timer = try sig.time.Timer.start();
@@ -396,11 +398,10 @@ fn downloadFile(
     var checked_speed = false;
 
     while (true) {
-        const max_bytes_to_read = @min(download_buffer.len, download_size - total_bytes_read);
-        const bytes_read = try request.readAll(download_buffer[0..max_bytes_to_read]);
+        const bytes_read = try downloader.read(download_size - total_bytes_read);
         total_bytes_read += bytes_read;
 
-        try buffered_out.writer().writeAll(download_buffer[0..bytes_read]);
+        try downloader.write(bytes_read);
         if (total_bytes_read == download_size) break;
         std.debug.assert(total_bytes_read < download_size);
 
@@ -437,7 +438,7 @@ fn downloadFile(
         logger.info().logf("[download progress]: speed is ok ({:.4}/s) -- maintaining", .{std.fmt.fmtIntSizeBin(actual_bytes_per_second)});
     }
 
-    try buffered_out.flush();
+    try downloader.flush();
     return output_file;
 }
 
@@ -624,6 +625,165 @@ pub fn getOrDownloadAndUnpackSnapshot(
 
     return .{ snapshot_fields, snapshot_files };
 }
+
+pub const BasicDownloader = struct {
+    request: *std.http.Client.Request,
+    download_buffer: []u8,
+    buf_writer: *std.io.BufferedWriter(4096, std.fs.File.Writer),
+};
+
+pub const SpliceDownloader = struct {
+    request: *std.http.Client.Request,
+    pipe: [2]std.posix.fd_t,
+    file: *const std.fs.File,
+};
+
+pub const Downloader = union(enum) {
+    basic: BasicDownloader,
+    splice: SpliceDownloader,
+
+    fn read(self: *const Downloader, read_max: usize) !usize {
+        switch (self.*) {
+            .basic => |b| {
+                const max_bytes_to_read = @min(b.download_buffer.len, read_max);
+                return b.request.readAll(b.download_buffer[0..max_bytes_to_read]);
+            },
+            .splice => |s| {
+                const socket = s.request.connection.?.stream.handle;
+                return LinuxSplice.splice(
+                    socket,
+                    null,
+                    s.pipe[1],
+                    null,
+                    1 << 20,
+                    0x4, // SPLICE_F_MORE = 0x4
+                );
+            },
+        }
+    }
+
+    fn write(self: *const Downloader, write_max: usize) !void {
+        switch (self.*) {
+            .basic => |b| try b.buf_writer.writer().writeAll(b.download_buffer[0..write_max]),
+            .splice => |s| {
+                var remaining = write_max;
+                while (remaining > 0) {
+                    remaining -= try LinuxSplice.splice(
+                        s.pipe[0],
+                        null,
+                        s.file.handle,
+                        null,
+                        remaining,
+                        0,
+                    );
+                }
+            },
+        }
+    }
+
+    fn flush(self: *const Downloader) !void {
+        switch (self.*) {
+            .basic => |b| try b.buf_writer.flush(),
+            else => {},
+        }
+    }
+
+    fn deinit(self: *const Downloader, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .basic => |b| {
+                allocator.free(b.download_buffer);
+            },
+            .splice => |s| {
+                std.posix.close(s.pipe[0]);
+                std.posix.close(s.pipe[1]);
+            },
+        }
+    }
+};
+
+fn getLastPathSegment(uri: std.Uri) []const u8 {
+    if (uri.path.isEmpty()) return "";
+
+    const path = switch (uri.path) {
+        .percent_encoded => |s| s,
+        .raw => |s| s,
+    };
+
+    if (path.len == 0) return "";
+
+    // pos of last non '/'
+    var end = path.len;
+    while (end > 0 and path[end - 1] == '/') : (end -= 1) {}
+
+    // pos of last '/'
+    var start = end;
+    while (start > 0 and path[start - 1] != '/') : (start -= 1) {}
+
+    // last segment
+    if (start >= end) return "";
+    return path[start..end];
+}
+
+// no significant improve
+// (on 4 core max 2.7GHz, 8Gi mem, linux 6.6.38-trim)
+// +-------------------+--------+--------+--------+----------+
+// | downloadSplice    |  min   |  max   |  mean  |  std_dev |
+// +===================+========+========+========+==========+
+// | download_snapshot |  11371 |  11706 |  11513 |  141     |
+// +-------------------+--------+--------+--------+----------+
+// +-------------------+--------+--------+--------+----------+
+// | downloadBasic     |  min   |  max   |  mean  |  std_dev |
+// +===================+========+========+========+==========+
+// | download_snapshot |  11475 |  11944 |  11635 |  218     |
+// +-------------------+--------+--------+--------+----------+
+pub const BenchmarkDownload = struct {
+    pub const min_iterations = 1;
+    pub const max_iterations = 5;
+
+    pub const SNAPSHOT_DIR_PATH = sig.TEST_DATA_DIR ++ "bench_download/";
+
+    pub const BenchArgs = struct {
+        name: []const u8,
+        snapshot_url: []const u8,
+    };
+
+    pub const args = [_]BenchArgs{BenchArgs{
+        .name = "download_snapshot",
+        .snapshot_url = "http://127.0.0.1:8000/test.zip",
+    }};
+
+    pub fn downloadSplice(bench_args: BenchArgs) !sig.time.Duration {
+        return doDownload(bench_args, false);
+    }
+
+    pub fn downloadBasic(bench_args: BenchArgs) !sig.time.Duration {
+        return doDownload(bench_args, true);
+    }
+
+    fn doDownload(bench_args: BenchArgs, force_basic: bool) !sig.time.Duration {
+        const allocator = std.heap.c_allocator;
+        var print_logger = sig.trace.DirectPrintLogger.init(allocator, .debug);
+        const logger = print_logger.logger();
+
+        const uri = try std.Uri.parse(bench_args.snapshot_url);
+        var snapshot_dir = try std.fs.cwd().makeOpenPath(SNAPSHOT_DIR_PATH, .{
+            .iterate = true,
+        });
+        defer snapshot_dir.close();
+        const filename = getLastPathSegment(uri);
+        const fullpath = try std.fs.path.join(allocator, &.{ SNAPSHOT_DIR_PATH, filename });
+        defer allocator.free(fullpath);
+        std.fs.cwd().deleteFile(fullpath) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+
+        var timer = try sig.time.Timer.start();
+        const file = try downloadFile(allocator, logger.withScope(LOG_SCOPE), uri, snapshot_dir, filename, 1, force_basic);
+        defer file.close();
+        return timer.read();
+    }
+};
 
 test "accounts_db.download: test remove untrusted peers" {
     const allocator = std.testing.allocator;
